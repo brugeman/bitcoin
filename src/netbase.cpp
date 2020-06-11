@@ -707,6 +707,52 @@ bool ConnectSocketDirectly(const CService &addrConnect, const SOCKET& hSocket, i
     return true;
 }
 
+
+/**
+ * Start connecting to the specified service on the specified socket,
+ * return without waiting for connection to establish.
+ *
+ * @param addrConnect The service to which to connect.
+ * @param hSocket The socket on which to connect.
+ * @param manual_connection Whether or not the connection was manually requested
+ *                          (e.g. through the addnode RPC)
+ *
+ * @returns 0 if connection is established, >0 if connection is establishing, <0 on error.
+ */
+int ConnectSocketStart(const CService &addrConnect, const SOCKET& hSocket, bool manual_connection)
+{
+    assert(hSocket != INVALID_SOCKET);
+
+    // Create a sockaddr from the specified service.
+    struct sockaddr_storage sockaddr;
+    socklen_t len = sizeof(sockaddr);
+    if (!addrConnect.GetSockAddr((struct sockaddr*)&sockaddr, &len)) {
+        LogPrintf("Cannot connect to %s: unsupported network\n", addrConnect.ToString());
+        return -1;
+    }
+
+    // Connect to the addrConnect service on the hSocket socket.
+    if (connect(hSocket, (struct sockaddr*)&sockaddr, len) == SOCKET_ERROR)
+    {
+        int nErr = WSAGetLastError();
+        // WSAEINVAL is here because some legacy version of winsock uses it
+        if (nErr == WSAEINPROGRESS || nErr == WSAEWOULDBLOCK || nErr == WSAEINVAL)
+        {
+	   return 1; // establishing
+        }
+#ifdef WIN32
+        else if (WSAGetLastError() != WSAEISCONN)
+#else
+        else
+#endif
+        {
+            LogConnectFailure(manual_connection, "connect() to %s failed: %s", addrConnect.ToString(), NetworkErrorString(WSAGetLastError()));
+            return -1;
+        }
+    }
+    return 0;
+}
+
 bool SetProxy(enum Network net, const proxyType &addrProxy) {
     assert(net >= 0 && net < NET_MAX);
     if (!addrProxy.IsValid())

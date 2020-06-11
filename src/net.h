@@ -113,7 +113,6 @@ struct CSerializedNetMsg
     std::string command;
 };
 
-
 class NetEventsInterface;
 class CConnman
 {
@@ -329,6 +328,8 @@ public:
 
     void SetAsmap(std::vector<bool> asmap) { addrman.m_asmap = std::move(asmap); }
 
+    bool AddInboundConnectionRequest(const CService& conn);
+
 private:
     struct ListenSocket {
     public:
@@ -339,7 +340,6 @@ private:
         NetPermissionFlags m_permissions;
     };
 
-    bool BindSocket(const int fd, const CService& addrBind, bilingual_str& strError);
     bool BindListenPort(const CService& bindAddr, bilingual_str& strError, NetPermissionFlags permissions);
     bool Bind(const CService& addr, unsigned int flags, NetPermissionFlags permissions);
     bool InitBinds(const std::vector<CService>& binds, const std::vector<NetWhitebindPermissions>& whiteBinds);
@@ -357,6 +357,13 @@ private:
     void SocketHandler();
     void ThreadSocketHandler();
     void ThreadDNSAddressSeed();
+    void SocketEventsWait(const std::set<SOCKET> &recv_select_set, const std::set<SOCKET> &send_select_set, const std::set<SOCKET> &error_select_set, std::set<SOCKET> &recv_set, std::set<SOCKET> &send_set, std::set<SOCKET> &error_set, const uint64_t timeout);
+
+    bool TryBindConnectSocket(CService connect_address, SOCKET sock) const;
+    void ThreadOpenInboundConnections();
+    void QueueInboundConnection(const CService & addr, SOCKET sock);
+    bool CanQueueInboundConnection();
+    void SetupInboundConnection(SOCKET hSocket, const CAddress & addr, NetPermissionFlags permissionFlags);
 
     uint64_t CalculateKeyedNetGroup(const CAddress& ad) const;
 
@@ -419,6 +426,14 @@ private:
     std::atomic<NodeId> nLastNodeId{0};
     unsigned int nPrevNodeCount{0};
 
+    // Queue of 'requests for inbound connection', address:deadline,
+    // deadline in millis allows consumer to drop expired requests
+    // as these are time-sensitive.
+    std::deque<std::pair<CService, uint64_t> > m_inbound_requests GUARDED_BY(m_cs_inbound_requests);
+    RecursiveMutex m_cs_inbound_requests;
+    std::deque<std::pair<CService, SOCKET> > m_inbound_connections GUARDED_BY(m_cs_inbound_connections);
+    RecursiveMutex m_cs_inbound_connections;
+
     /**
      * Services this instance offers.
      *
@@ -452,6 +467,9 @@ private:
     CClientUIInterface* clientInterface;
     NetEventsInterface* m_msgproc;
     BanMan* m_banman;
+    // This vector is only written in Init and never modified later,
+    // so we don't protect it with a mutex even though several
+    // threads read from it.
     std::vector<CService> m_bind_connects;
 
     /** SipHasher seeds for deterministic randomness */
@@ -471,6 +489,7 @@ private:
     std::thread threadOpenAddedConnections;
     std::thread threadOpenConnections;
     std::thread threadMessageHandler;
+    std::thread threadOpenInboundConnections;
 
     /** flag for deciding to connect to an extra outbound peer,
      *  in excess of m_max_outbound_full_relay

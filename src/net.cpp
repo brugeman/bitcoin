@@ -89,6 +89,39 @@ enum BindFlags {
 // The sleep time needs to be small to avoid new sockets stalling
 static const uint64_t SELECT_TIMEOUT_MILLISECONDS = 50;
 
+// Number of active inbound connections being established,
+// making it more than 1 protects from a single slow peer
+// effectively blocking us from 'accepting' other connections.
+// FIXME talk about why 10?
+static const size_t MAX_ACTIVE_INBOUNDS = 10;
+// This number should be around the number of Relays we're
+// connected to, so that 1 request per Relay could fit.
+// FIXME why not make this and above number same and == to RELAY_NUM?
+static const size_t MAX_INBOUND_QUEUE_SIZE = 10;
+// Inbound connection attempt timeout, should cover
+// the total timeout that our outbound peer puts over
+// his hole-punching attempts (say 3 sec to deliver
+// request-for-connection, 3 sec to wait for our SYN, and
+// 3 sec to wait for his retry SYN.
+static const uint64_t INBOUND_CONNECT_TIMEOUT = 10000; // ms
+// Inbound connection queue timeout, should be higher
+// than connect timeout to make sure queued requests survive
+// the block caused by spammers.
+static const uint64_t INBOUND_QUEUE_TIMEOUT = 15000; // ms
+// FIXME peers that initiate the hole punching should
+// retry connection attempts at least
+// INBOUND_CONNECT_TIMEOUT+INBOUND_QUEUE_TIMEOUT time every 3 seconds
+// Hole punching dance:
+// - send request to Relay
+//  - Relay forwards to peer, which might take say 3 sec
+// - wait for delivery by Relay (just wait 3 sec)
+//  - otherwise if we send our SYN immediately then it will likely get to peer
+//    before Relay forwards the request and thus will be rejeted by peer's NAT
+// - do first 'connect' attempt
+// - after 3 sec close the socket and retry sending through different relay
+// - so send to Relay, wait 3 sec, connect, wait 3 sec => 6 sec, 2 packets
+// - peer: receive from Relay, send connect, wait 3 sec on average - 2 packets
+
 const std::string NET_MESSAGE_COMMAND_OTHER = "*other*";
 
 static const uint64_t RANDOMIZER_ID_NETGROUP = 0x6c0edd8036ef4036ULL; // SHA256("netgroup")[0:8]
@@ -367,6 +400,75 @@ static CAddress GetBindAddress(SOCKET sock)
     return addr_bind;
 }
 
+static bool BindSocket(const SOCKET sock, const CService& addrBind, bilingual_str& strError)
+{
+    int nOne = 1;
+
+    // Get bind address
+    struct sockaddr_storage sockaddr;
+    socklen_t len = sizeof(sockaddr);
+    if (!addrBind.GetSockAddr((struct sockaddr*)&sockaddr, &len))
+    {
+        strError = strprintf(Untranslated("Error: Bind address family for %s not supported"), addrBind.ToString());
+        LogPrintf("%s\n", strError.original);
+        return false;
+    }
+
+    // Allow binding if the port is still in TIME_WAIT state after
+    // the program was closed and restarted.
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int));
+
+    // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option
+    // and enable it by default or not. Try to enable it, if possible.
+    if (addrBind.IsIPv6()) {
+#ifdef IPV6_V6ONLY
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int));
+#endif
+#ifdef WIN32
+        int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
+        setsockopt(sock, IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int));
+#endif
+    }
+
+    if (::bind(sock, (struct sockaddr*)&sockaddr, len) == SOCKET_ERROR)
+    {
+        int nErr = WSAGetLastError();
+        if (nErr == WSAEADDRINUSE)
+            strError = strprintf(_("Unable to bind to %s on this computer. %s is probably already running."), addrBind.ToString(), PACKAGE_NAME);
+        else
+            strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToString(), NetworkErrorString(nErr));
+        LogPrintf("%s\n", strError.original);
+        return false;
+    }
+    LogPrintf("Bound to %s\n", addrBind.ToString());
+
+    return true;
+}
+
+bool CConnman::TryBindConnectSocket(CService connect_address, SOCKET sock) const {
+
+   // Try to bind if -bindconnect was specified
+   bool bound = false;
+   bilingual_str bind_error;
+
+   for (const CService& bind_address: m_bind_connects) {
+
+      if ((bind_address.IsIPv4() && connect_address.IsIPv4())
+	  || (bind_address.IsIPv6() && connect_address.IsIPv6())) {
+
+	 bound = BindSocket(sock, bind_address, bind_error);
+	 if (bound) {
+	    LogPrintf("Connecting to '%s' bound to '%s'\n",
+		      connect_address.ToString().c_str(), bind_address.ToString());
+	    break;
+	 }
+      }
+   }
+
+   return bound;
+}
+
+
 CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, bool manual_connection, bool block_relay_only)
 {
     if (pszDest == nullptr) {
@@ -432,24 +534,9 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                 return nullptr;
             }
 
-	    // Try to bind if -bindconnect was specified
-	    bool bound = false;
-	    bilingual_str bind_error;
-
-	    for(const CService& bind_address: m_bind_connects) {
-	       if ((bind_address.IsIPv4() && addrConnect.IsIPv4())
-		   || (bind_address.IsIPv6() && addrConnect.IsIPv6())) {
-
-		  bound = BindSocket(hSocket, bind_address, bind_error);
-		  if (bound) {
-		     LogPrintf("Connecting to '%s' bound to '%s'\n",
-			       addrConnect.ToString().c_str(), bind_address.ToString());
-		     break;
-		  }
-	       }
-	    }
-	    // Try to proceed even if we failed to bind,
-	    // maybe the connection gets through somehow...
+	    // Proceed even if we fail to bind, maybe somehow the connection
+	    // gets through
+	    TryBindConnectSocket(addrConnect, hSocket);
 
             connected = ConnectSocketDirectly(addrConnect, hSocket, nConnectTimeout, manual_connection);
         }
@@ -975,6 +1062,7 @@ void CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
     struct sockaddr_storage sockaddr;
     socklen_t len = sizeof(sockaddr);
     SOCKET hSocket = accept(hListenSocket.socket, (struct sockaddr*)&sockaddr, &len);
+
     CAddress addr;
     int nInbound = 0;
     int nMaxInbound = nMaxConnections - m_max_outbound;
@@ -987,6 +1075,15 @@ void CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
 
     NetPermissionFlags permissionFlags = NetPermissionFlags::PF_NONE;
     hListenSocket.AddSocketPermissionFlags(permissionFlags);
+
+    SetupInboundConnection(hSocket, addr, permissionFlags);
+}
+
+void CConnman::SetupInboundConnection(SOCKET hSocket, const CAddress & addr, NetPermissionFlags permissionFlags) {
+
+    int nInbound = 0;
+    int nMaxInbound = nMaxConnections - m_max_outbound;
+
     AddWhitelistPermissionFlags(permissionFlags, addr);
     bool legacyWhitelisted = false;
     if (NetPermissions::HasFlag(permissionFlags, NetPermissionFlags::PF_ISIMPLICIT)) {
@@ -1233,7 +1330,6 @@ bool CConnman::GenerateSelectSet(std::set<SOCKET> &recv_set, std::set<SOCKET> &s
     return !recv_set.empty() || !send_set.empty() || !error_set.empty();
 }
 
-#ifdef USE_POLL
 void CConnman::SocketEvents(std::set<SOCKET> &recv_set, std::set<SOCKET> &send_set, std::set<SOCKET> &error_set)
 {
     std::set<SOCKET> recv_select_set, send_select_set, error_select_set;
@@ -1242,6 +1338,17 @@ void CConnman::SocketEvents(std::set<SOCKET> &recv_set, std::set<SOCKET> &send_s
         return;
     }
 
+    SocketEventsWait(recv_select_set, send_select_set, error_select_set,
+		     recv_set, send_set, error_set,
+		     SELECT_TIMEOUT_MILLISECONDS);
+}
+
+#ifdef USE_POLL
+void CConnman::SocketEventsWait(
+   const std::set<SOCKET> &recv_select_set, const std::set<SOCKET> &send_select_set, const std::set<SOCKET> &error_select_set,
+   std::set<SOCKET> &recv_set, std::set<SOCKET> &send_set, std::set<SOCKET> &error_set,
+   const uint64_t timeout)
+{
     std::unordered_map<SOCKET, struct pollfd> pollfds;
     for (SOCKET socket_id : recv_select_set) {
         pollfds[socket_id].fd = socket_id;
@@ -1265,7 +1372,7 @@ void CConnman::SocketEvents(std::set<SOCKET> &recv_set, std::set<SOCKET> &send_s
         vpollfds.push_back(std::move(it.second));
     }
 
-    if (poll(vpollfds.data(), vpollfds.size(), SELECT_TIMEOUT_MILLISECONDS) < 0) return;
+    if (poll(vpollfds.data(), vpollfds.size(), timeout) < 0) return;
 
     if (interruptNet) return;
 
@@ -1276,20 +1383,17 @@ void CConnman::SocketEvents(std::set<SOCKET> &recv_set, std::set<SOCKET> &send_s
     }
 }
 #else
-void CConnman::SocketEvents(std::set<SOCKET> &recv_set, std::set<SOCKET> &send_set, std::set<SOCKET> &error_set)
+void CConnman::SocketEventsWait(
+   const std::set<SOCKET> &recv_select_set, const std::set<SOCKET> &send_select_set, const std::set<SOCKET> &error_select_set,
+   std::set<SOCKET> &recv_set, std::set<SOCKET> &send_set, std::set<SOCKET> &error_set,
+   const uint64_t timeout_ms)
 {
-    std::set<SOCKET> recv_select_set, send_select_set, error_select_set;
-    if (!GenerateSelectSet(recv_select_set, send_select_set, error_select_set)) {
-        interruptNet.sleep_for(std::chrono::milliseconds(SELECT_TIMEOUT_MILLISECONDS));
-        return;
-    }
-
     //
     // Find which sockets have data to receive
     //
     struct timeval timeout;
     timeout.tv_sec  = 0;
-    timeout.tv_usec = SELECT_TIMEOUT_MILLISECONDS * 1000; // frequency to poll pnode->vSend
+    timeout.tv_usec = timeout_ms * 1000; // frequency to poll pnode->vSend
 
     fd_set fdsetRecv;
     fd_set fdsetSend;
@@ -1327,7 +1431,7 @@ void CConnman::SocketEvents(std::set<SOCKET> &recv_set, std::set<SOCKET> &send_s
             FD_SET(i, &fdsetRecv);
         FD_ZERO(&fdsetSend);
         FD_ZERO(&fdsetError);
-        if (!interruptNet.sleep_for(std::chrono::milliseconds(SELECT_TIMEOUT_MILLISECONDS)))
+        if (!interruptNet.sleep_for(std::chrono::milliseconds(timeout_ms)))
             return;
     }
 
@@ -1367,6 +1471,18 @@ void CConnman::SocketHandler()
         {
             AcceptConnection(hListenSocket);
         }
+    }
+
+    // Process inbound sockets
+    std::deque<std::pair<CService, SOCKET> > inbound_connections;
+    {
+       TRY_LOCK(m_cs_inbound_connections, lock);
+       if (lock) {
+	  std::swap(inbound_connections, m_inbound_connections);
+       }
+    }
+    for (const auto& s: inbound_connections) {
+       SetupInboundConnection(s.second, CAddress(s.first, NODE_NONE), NetPermissionFlags::PF_NONE);
     }
 
     //
@@ -2052,6 +2168,209 @@ void CConnman::ThreadOpenAddedConnections()
     }
 }
 
+bool CConnman::AddInboundConnectionRequest(const CService& addr)
+{
+   TRY_LOCK(m_cs_inbound_requests, lock);
+   if (!lock) return false;
+
+   // Caller must ensure that supplied addrs come from different sources
+   // which are fair-queued with a pause to throttle them.
+   // This way we avoid getting all our connect slots occupied
+   // by a single spammer source.
+
+   // If queue is full, 'false' is returned, and caller should retry later.
+
+   // Drop expired requests first
+   const auto now = GetTimeMillis();
+   while (m_inbound_requests.size() >= MAX_INBOUND_QUEUE_SIZE) {
+      const auto & c = m_inbound_requests.front();
+      if (c.second >= now)
+	 break;
+      m_inbound_requests.pop_front();
+   }
+
+   // Still no room?
+   if (m_inbound_requests.size() >= MAX_INBOUND_QUEUE_SIZE)
+      return false;
+
+   // Set the deadline
+   const auto deadline = now + INBOUND_QUEUE_TIMEOUT;
+   m_inbound_requests.push_back(std::make_pair(addr, deadline));
+
+   return true;
+}
+
+void CConnman::QueueInboundConnection(const CService & addr, SOCKET sock)
+{
+   assert(sock != INVALID_SOCKET);
+   LOCK(m_cs_inbound_connections);
+   m_inbound_connections.push_back(std::make_pair(addr, sock));
+}
+
+bool CConnman::CanQueueInboundConnection() {
+   TRY_LOCK(m_cs_inbound_connections, lock);
+   if (!lock) return false;
+   return m_inbound_connections.empty();
+}
+
+void CConnman::ThreadOpenInboundConnections()
+{
+    // Helper struct to track active connection attempts
+    struct Conn {
+       CService address;
+       SOCKET sock;
+       uint64_t deadline; // ms
+       bool retry;
+    };
+
+    // Active connection attempts
+    std::list<Conn> active_conns;
+    // New request 
+    std::pair<CService, uint64_t> request;
+    while (!interruptNet)
+    {
+	// Check active attempts limit
+	const bool can_start = active_conns.size() < MAX_ACTIVE_INBOUNDS;
+
+	// Read new request if we're not retrying and if we're not pushed back 
+	if (!request.first.IsRoutable() && can_start && CanQueueInboundConnection()) {
+
+            // Don't block if producer was pre-empted
+            TRY_LOCK(m_cs_inbound_requests, lock);
+	    if (lock) {
+	       if (!m_inbound_requests.empty()) {
+		  request = std::move(m_inbound_requests.front());
+		  m_inbound_requests.pop_front();
+	       }
+	    }
+	}
+
+	// Get current time
+	uint64_t now = GetTimeMillis();
+
+	// Empty queue and we're idle? Block
+	if (!request.first.IsRoutable() && active_conns.empty()) {
+	    // Sleep for a while and then retry reading from queue
+	    if (!interruptNet.sleep_for(std::chrono::milliseconds(100)))
+	        return;
+	    continue;
+	}
+
+	// Deadline expired? Drop it
+	if (now > request.second) {
+	    request.first = CService();
+	}
+
+	// Check if we have active connection to the same address,
+	// if so - mark it to retry if it fails
+	if (request.first.IsRoutable()) {
+	   for (auto& c: active_conns) {
+	      if (c.address == request.first) {
+		 c.retry = true;
+		 request.first = CService();
+	      }
+	   }
+	}
+
+	// Got valid request?
+	if (request.first.IsRoutable()) {
+
+	   SOCKET sock = CreateSocket(request.first);
+	   if (sock != INVALID_SOCKET) {
+
+	      if (TryBindConnectSocket(request.first, sock)) {
+
+		 // Start connect
+		 int r = ConnectSocketStart(request.first, sock, /* manual_connection= */false);
+		 if (r == 0) {
+		    // Connected immediately, add to acceptor queue,
+		    // Might block!
+		    QueueInboundConnection(request.first, sock);
+		 } else if (r > 1) {
+		    // Waiting for connection
+		    active_conns.push_back(Conn{request.first, sock, now + INBOUND_CONNECT_TIMEOUT, false}); 
+		 } else {
+		    // Failed to start connection
+		    CloseSocket(sock);
+		 }
+	      }
+	   }
+
+	   // Clear request
+	   request.first = CService();
+	}
+
+	// Update current time bcs the above code might block
+	now = GetTimeMillis();
+
+	// Wait for events on active connections
+	std::set<SOCKET> events;
+	if (!active_conns.empty()) {
+
+	   uint64_t timeout = INBOUND_CONNECT_TIMEOUT;
+	   std::set<SOCKET> recv_select_set, send_select_set, error_select_set;
+	   std::set<SOCKET> recv_set, send_set, error_set;
+	   for(const auto& c: active_conns) {
+	      if (c.deadline > now) {
+		 recv_select_set.insert(c.sock);
+		 send_select_set.insert(c.sock);
+		 timeout = std::min(timeout, c.deadline - now);
+	      }
+	   }
+
+	   // Wait
+	   if (!recv_select_set.empty() || !send_select_set.empty()) {
+	      SocketEventsWait(recv_select_set, send_select_set, error_select_set,
+			       recv_set, send_set, error_set,
+			       timeout);
+	   }
+
+	   // Collect results
+	   events.insert(recv_set.begin(), recv_set.end());
+	   events.insert(send_set.begin(), send_set.end());
+	}
+
+	// Collect active conns
+	std::deque<Conn> ready_conns;
+	for (auto i = active_conns.begin(), end = active_conns.end(); i != end; ) {
+	   auto & c = *i;
+	   if (events.find(c.sock) != events.end()) {
+	      ready_conns.emplace_back(std::move(c));
+	      i = active_conns.erase(i);
+	   } else {
+	      ++i;
+	   }
+	}
+
+	// Update current time after waiting
+	now = GetTimeMillis();
+
+	// Process timeouts, assuming conns are ordered by deadlines asc
+	while (!active_conns.empty()) {
+	   auto i = active_conns.begin();
+	   auto & c = *i;
+	   if (c.deadline > now)
+	      break;
+
+	   LogPrint(BCLog::NET, "Inbound connection attept to '%s' timeout retry %d\n", c.address.ToString(), c.retry);
+	   CloseSocket(c.sock);
+
+	   if (c.retry) {
+	      request.first = c.address;
+	      request.second = now + INBOUND_QUEUE_TIMEOUT;
+	   }
+
+	   active_conns.erase(i);
+	}
+
+	// Send ready conns to acceptor, this part might block
+	// and so timeout processing must be done before this
+	for (const auto & c: ready_conns) {
+	   QueueInboundConnection(c.address, c.sock);
+	}
+    }
+}
+
 // if successful, this moves the passed grant to the constructed node
 void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant *grantOutbound, const char *pszDest, bool fOneShot, bool fFeeler, bool manual_connection, bool block_relay_only)
 {
@@ -2139,52 +2458,6 @@ void CConnman::ThreadMessageHandler()
         }
         fMsgProcWake = false;
     }
-}
-
-
-bool CConnman::BindSocket(const int fd, const CService& addrBind, bilingual_str& strError)
-{
-    int nOne = 1;
-
-    // Get bind address
-    struct sockaddr_storage sockaddr;
-    socklen_t len = sizeof(sockaddr);
-    if (!addrBind.GetSockAddr((struct sockaddr*)&sockaddr, &len))
-    {
-        strError = strprintf(Untranslated("Error: Bind address family for %s not supported"), addrBind.ToString());
-        LogPrintf("%s\n", strError.original);
-        return false;
-    }
-
-    // Allow binding if the port is still in TIME_WAIT state after
-    // the program was closed and restarted.
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int));
-
-    // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option
-    // and enable it by default or not. Try to enable it, if possible.
-    if (addrBind.IsIPv6()) {
-#ifdef IPV6_V6ONLY
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int));
-#endif
-#ifdef WIN32
-        int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
-        setsockopt(fd, IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int));
-#endif
-    }
-
-    if (::bind(fd, (struct sockaddr*)&sockaddr, len) == SOCKET_ERROR)
-    {
-        int nErr = WSAGetLastError();
-        if (nErr == WSAEADDRINUSE)
-            strError = strprintf(_("Unable to bind to %s on this computer. %s is probably already running."), addrBind.ToString(), PACKAGE_NAME);
-        else
-            strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToString(), NetworkErrorString(nErr));
-        LogPrintf("%s\n", strError.original);
-        return false;
-    }
-    LogPrintf("Bound to %s\n", addrBind.ToString());
-
-    return true;
 }
 
 bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions)
@@ -2361,7 +2634,7 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         clientInterface->InitMessage(_("Loading P2P addresses...").translated);
     }
     // Load addresses from peers.dat
-    int64_t nStart = GetTimeMillis();
+    int64_t nStart = GetTimeMillis(); 
     {
         CAddrDB adb;
         if (adb.Read(addrman))
@@ -2424,6 +2697,9 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
     // Process messages
     threadMessageHandler = std::thread(&TraceThread<std::function<void()> >, "msghand", std::function<void()>(std::bind(&CConnman::ThreadMessageHandler, this)));
 
+    // Process inbound connect requests
+    threadOpenInboundConnections = std::thread(&TraceThread<std::function<void()> >, "inbcon", std::function<void()>(std::bind(&CConnman::ThreadOpenInboundConnections, this)));
+
     // Dump network addresses
     scheduler.scheduleEvery([this] { DumpAddresses(); }, DUMP_PEERS_INTERVAL);
 
@@ -2481,6 +2757,8 @@ void CConnman::StopThreads()
         threadDNSAddressSeed.join();
     if (threadSocketHandler.joinable())
         threadSocketHandler.join();
+    if (threadOpenInboundConnections.joinable())
+        threadOpenInboundConnections.join();
 }
 
 void CConnman::StopNodes()
