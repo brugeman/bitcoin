@@ -71,6 +71,8 @@ AC_DEFUN([AX_BOOST_THREAD],
                  CXXFLAGS="-pthreads $CXXFLAGS"
              elif test "x$host_os" = "xmingw32" ; then
                  CXXFLAGS="-mthreads $CXXFLAGS"
+             elif test "x$host_os" = "xlinux-android" ; then
+                 CXXFLAGS="$CXXFLAGS"
              else
                 CXXFLAGS="-pthread $CXXFLAGS"
              fi
@@ -88,6 +90,8 @@ AC_DEFUN([AX_BOOST_THREAD],
               BOOST_CPPFLAGS="-pthreads $BOOST_CPPFLAGS"
            elif test "x$host_os" = "xmingw32" ; then
               BOOST_CPPFLAGS="-mthreads $BOOST_CPPFLAGS"
+           elif test "x$host_os" = "xlinux-android" ; then
+              BOOST_CPPFLAGS="$BOOST_CPPFLAGS"
            else
               BOOST_CPPFLAGS="-pthread $BOOST_CPPFLAGS"
            fi
@@ -146,6 +150,9 @@ AC_DEFUN([AX_BOOST_THREAD],
                         break;
                         ;;
                     xmingw32 )
+                        break;
+                        ;;
+                    xlinux-android )
                         break;
                         ;;
                     * )

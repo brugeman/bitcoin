@@ -430,6 +430,7 @@ void SetupServerArgs(NodeContext& node)
     gArgs.AddArg("-banscore=<n>", strprintf("Threshold for disconnecting misbehaving peers (default: %u)", DEFAULT_BANSCORE_THRESHOLD), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     gArgs.AddArg("-bantime=<n>", strprintf("Number of seconds to keep misbehaving peers from reconnecting (default: %u)", DEFAULT_MISBEHAVING_BANTIME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     gArgs.AddArg("-bind=<addr>", "Bind to given address and always listen on it. Use [host]:port notation for IPv6", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    gArgs.AddArg("-bindconnect=<addr>", "Bind outbound connections to given address, if several are given will try them one by one, if addr not given will use the addrs we bind to (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     gArgs.AddArg("-connect=<ip>", "Connect only to the specified node; -noconnect disables automatic connections (the rules for this peer are the same as for -addnode). This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     gArgs.AddArg("-discover", "Discover own IP addresses (default: 1 when listening and no -externalip or -proxy)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     gArgs.AddArg("-dns", strprintf("Allow DNS lookups for -addnode, -seednode and -connect (default: %u)", DEFAULT_NAME_LOOKUP), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -1913,6 +1914,47 @@ bool AppInitMain(const util::Ref& context, NodeContext& node)
         bilingual_str error;
         if (!NetWhitebindPermissions::TryParse(strBind, whitebind, error)) return InitError(error);
         connOptions.vWhiteBinds.push_back(whitebind);
+    }
+
+    if (gArgs.IsArgSet("-bindconnect")) {
+        const auto addrs = gArgs.GetArgs("-bindconnect");
+        if (addrs.empty() || addrs[0].empty()) {
+            // No specific addrs given, reuse the ones from -bind/-whitebind/-listen
+
+            if (!connOptions.vBinds.empty()) {
+                // Copy bind addrs
+                connOptions.m_bind_connects = connOptions.vBinds;
+            } 
+
+            if (!connOptions.vWhiteBinds.empty()) {
+                // Copy white addrs
+                for (const auto& addrBind : connOptions.vWhiteBinds) {
+                    connOptions.m_bind_connects.push_back(addrBind.m_service);
+                }
+            }
+
+            if (connOptions.m_bind_connects.empty()) {
+                // Add _any_ addrs w/ the listen port
+                struct in_addr inaddr_any;
+                inaddr_any.s_addr = INADDR_ANY;
+                connOptions.m_bind_connects.push_back(CService(inaddr_any, GetListenPort()));
+
+                struct in6_addr inaddr6_any = IN6ADDR_ANY_INIT;
+                connOptions.m_bind_connects.push_back(CService(inaddr6_any, GetListenPort()));
+            }
+        } else {
+            // Add given bindconnect addrs 
+            for (const std::string& addr : addrs) {
+                CService service;
+                if (!Lookup(addr, service, GetListenPort(), false)) {
+		    return InitError(ResolveErrMsg("bindconnect", addr));
+                }
+                connOptions.m_bind_connects.push_back(service);
+            }
+        }
+	for(const auto& addr: connOptions.m_bind_connects) {
+	   LogPrintf("Bindconnect addr '%s'\n", addr.ToString().c_str());
+	}
     }
 
     for (const auto& net : gArgs.GetArgs("-whitelist")) {
