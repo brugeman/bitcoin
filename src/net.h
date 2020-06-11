@@ -339,7 +339,6 @@ private:
         NetPermissionFlags m_permissions;
     };
 
-    bool BindSocket(const int fd, const CService& addrBind, bilingual_str& strError);
     bool BindListenPort(const CService& bindAddr, bilingual_str& strError, NetPermissionFlags permissions);
     bool Bind(const CService& addr, unsigned int flags, NetPermissionFlags permissions);
     bool InitBinds(const std::vector<CService>& binds, const std::vector<NetWhitebindPermissions>& whiteBinds);

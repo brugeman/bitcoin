@@ -367,6 +367,51 @@ static CAddress GetBindAddress(SOCKET sock)
     return addr_bind;
 }
 
+static bool BindSocket(const SOCKET sock, const CService& addrBind, bilingual_str& strError)
+{
+    int nOne = 1;
+
+    // Get bind address
+    struct sockaddr_storage sockaddr;
+    socklen_t len = sizeof(sockaddr);
+    if (!addrBind.GetSockAddr((struct sockaddr*)&sockaddr, &len))
+    {
+        strError = strprintf(Untranslated("Error: Bind address family for %s not supported"), addrBind.ToString());
+        LogPrintf("%s\n", strError.original);
+        return false;
+    }
+
+    // Allow binding if the port is still in TIME_WAIT state after
+    // the program was closed and restarted.
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int));
+
+    // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option
+    // and enable it by default or not. Try to enable it, if possible.
+    if (addrBind.IsIPv6()) {
+#ifdef IPV6_V6ONLY
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int));
+#endif
+#ifdef WIN32
+        int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
+        setsockopt(sock, IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int));
+#endif
+    }
+
+    if (::bind(sock, (struct sockaddr*)&sockaddr, len) == SOCKET_ERROR)
+    {
+        int nErr = WSAGetLastError();
+        if (nErr == WSAEADDRINUSE)
+            strError = strprintf(_("Unable to bind to %s on this computer. %s is probably already running."), addrBind.ToString(), PACKAGE_NAME);
+        else
+            strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToString(), NetworkErrorString(nErr));
+        LogPrintf("%s\n", strError.original);
+        return false;
+    }
+    LogPrintf("Bound to %s\n", addrBind.ToString());
+
+    return true;
+}
+
 CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, bool manual_connection, bool block_relay_only)
 {
     if (pszDest == nullptr) {
@@ -2141,51 +2186,6 @@ void CConnman::ThreadMessageHandler()
     }
 }
 
-
-bool CConnman::BindSocket(const int fd, const CService& addrBind, bilingual_str& strError)
-{
-    int nOne = 1;
-
-    // Get bind address
-    struct sockaddr_storage sockaddr;
-    socklen_t len = sizeof(sockaddr);
-    if (!addrBind.GetSockAddr((struct sockaddr*)&sockaddr, &len))
-    {
-        strError = strprintf(Untranslated("Error: Bind address family for %s not supported"), addrBind.ToString());
-        LogPrintf("%s\n", strError.original);
-        return false;
-    }
-
-    // Allow binding if the port is still in TIME_WAIT state after
-    // the program was closed and restarted.
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int));
-
-    // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option
-    // and enable it by default or not. Try to enable it, if possible.
-    if (addrBind.IsIPv6()) {
-#ifdef IPV6_V6ONLY
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int));
-#endif
-#ifdef WIN32
-        int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
-        setsockopt(fd, IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int));
-#endif
-    }
-
-    if (::bind(fd, (struct sockaddr*)&sockaddr, len) == SOCKET_ERROR)
-    {
-        int nErr = WSAGetLastError();
-        if (nErr == WSAEADDRINUSE)
-            strError = strprintf(_("Unable to bind to %s on this computer. %s is probably already running."), addrBind.ToString(), PACKAGE_NAME);
-        else
-            strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToString(), NetworkErrorString(nErr));
-        LogPrintf("%s\n", strError.original);
-        return false;
-    }
-    LogPrintf("Bound to %s\n", addrBind.ToString());
-
-    return true;
-}
 
 bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions)
 {

@@ -1953,7 +1953,7 @@ bool AppInitMain(const util::Ref& context, NodeContext& node)
             }
         }
 	for(const auto& addr: connOptions.m_bind_connects) {
-	   LogPrintf("Bindconnect addr '%s'\n", addr.ToString().c_str());
+	   LogPrintf("Bindconnect addr '%s'\n", addr.ToString());
 	}
     }
 
