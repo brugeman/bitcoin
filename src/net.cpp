@@ -468,7 +468,6 @@ bool CConnman::TryBindConnectSocket(CService connect_address, SOCKET sock) const
    return bound;
 }
 
-
 CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, bool manual_connection, bool block_relay_only)
 {
     if (pszDest == nullptr) {
@@ -2634,7 +2633,7 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         clientInterface->InitMessage(_("Loading P2P addresses...").translated);
     }
     // Load addresses from peers.dat
-    int64_t nStart = GetTimeMillis(); 
+    int64_t nStart = GetTimeMillis();
     {
         CAddrDB adb;
         if (adb.Read(addrman))
