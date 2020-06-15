@@ -328,6 +328,7 @@ public:
 
     void SetAsmap(std::vector<bool> asmap) { addrman.m_asmap = std::move(asmap); }
 
+    // Asserts that conn IsValid()
     bool AddInboundConnectionRequest(const CService& conn);
 
 private:

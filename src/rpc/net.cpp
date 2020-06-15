@@ -5,6 +5,7 @@
 #include <rpc/server.h>
 
 #include <banman.h>
+#include <chainparams.h>
 #include <clientversion.h>
 #include <core_io.h>
 #include <net.h>
@@ -233,7 +234,7 @@ static UniValue addnode(const JSONRPCRequest& request)
     if (!request.params[1].isNull())
         strCommand = request.params[1].get_str();
     if (request.fHelp || request.params.size() != 2 ||
-        (strCommand != "onetry" && strCommand != "add" && strCommand != "remove"))
+        (strCommand != "onetry" && strCommand != "add" && strCommand != "remove" && strCommand != "inbound"))
         throw std::runtime_error(
             RPCHelpMan{"addnode",
                 "\nAttempts to add or remove a node from the addnode list.\n"
@@ -242,7 +243,7 @@ static UniValue addnode(const JSONRPCRequest& request)
                 "full nodes/support SegWit as other outbound peers are (though such peers will not be synced from).\n",
                 {
                     {"node", RPCArg::Type::STR, RPCArg::Optional::NO, "The node (see getpeerinfo for nodes)"},
-                    {"command", RPCArg::Type::STR, RPCArg::Optional::NO, "'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once"},
+                    {"command", RPCArg::Type::STR, RPCArg::Optional::NO, "'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once, 'inbound' to connect once and treat it as an inbound connection."},
                 },
                 RPCResult{RPCResult::Type::NONE, "", ""},
                 RPCExamples{
@@ -256,6 +257,17 @@ static UniValue addnode(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_CLIENT_P2P_DISABLED, "Error: Peer-to-peer functionality missing or disabled");
 
     std::string strNode = request.params[0].get_str();
+
+    if (strCommand == "inbound")
+    {
+        CService service(LookupNumeric(strNode, Params().GetDefaultPort()));
+	if (!service.IsValid())
+            throw JSONRPCError(RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid numeric address");
+	if (!node.connman->AddInboundConnectionRequest(service))
+            throw JSONRPCError(RPC_MISC_ERROR, "Error: Too many inbound requests");
+
+	return NullUniValue;
+    }
 
     if (strCommand == "onetry")
     {
@@ -327,7 +339,7 @@ static UniValue getaddednodeinfo(const JSONRPCRequest& request)
 {
             RPCHelpMan{"getaddednodeinfo",
                 "\nReturns information about the given added node, or all added nodes\n"
-                "(note that onetry addnodes are not listed here)\n",
+                "(note that onetry/inbound addnodes are not listed here)\n",
                 {
                     {"node", RPCArg::Type::STR, /* default */ "all nodes", "If provided, return information about this specific node, otherwise all nodes are returned."},
                 },

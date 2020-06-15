@@ -2169,8 +2169,9 @@ void CConnman::ThreadOpenAddedConnections()
 
 bool CConnman::AddInboundConnectionRequest(const CService& addr)
 {
-   TRY_LOCK(m_cs_inbound_requests, lock);
-   if (!lock) return false;
+   assert(addr.IsValid());
+
+   LOCK(m_cs_inbound_requests);
 
    // Caller must ensure that supplied addrs come from different sources
    // which are fair-queued with a pause to throttle them.
@@ -2202,6 +2203,7 @@ bool CConnman::AddInboundConnectionRequest(const CService& addr)
 void CConnman::QueueInboundConnection(const CService & addr, SOCKET sock)
 {
    assert(sock != INVALID_SOCKET);
+   LogPrint(BCLog::NET, "Queueing new inbound conn to '%s' sock %d\n", addr.ToString(), sock);
    LOCK(m_cs_inbound_connections);
    m_inbound_connections.push_back(std::make_pair(addr, sock));
 }
@@ -2281,11 +2283,12 @@ void CConnman::ThreadOpenInboundConnections()
 
 		 // Start connect
 		 int r = ConnectSocketStart(request.first, sock, /* manual_connection= */false);
+		 // LogPrint(BCLog::NET, "Inbound connection to '%s' r %d\n", request.first.ToString(), r);
 		 if (r == 0) {
 		    // Connected immediately, add to acceptor queue,
 		    // Might block!
 		    QueueInboundConnection(request.first, sock);
-		 } else if (r > 1) {
+		 } else if (r > 0) {
 		    // Waiting for connection
 		    active_conns.push_back(Conn{request.first, sock, now + INBOUND_CONNECT_TIMEOUT, false}); 
 		 } else {
@@ -2316,6 +2319,7 @@ void CConnman::ThreadOpenInboundConnections()
 		 timeout = std::min(timeout, c.deadline - now);
 	      }
 	   }
+	   // LogPrint(BCLog::NET, "Inbound conns %lu timeout %llu\n", active_conns.size(), timeout);
 
 	   // Wait
 	   if (!recv_select_set.empty() || !send_select_set.empty()) {
